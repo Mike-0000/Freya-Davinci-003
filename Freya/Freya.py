@@ -38,7 +38,7 @@ content = ""
 def gpt3(stext):
     openai.api_key = get_key()
     response = openai.Completion.create(
-        engine="text-davinci-001",
+        engine="text-davinci-003",
         prompt=stext,
         temperature=0.9,
         max_tokens=150,
