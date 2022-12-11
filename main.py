@@ -1,28 +1,26 @@
-import sys
-
-from boto3 import Session
-from botocore.exceptions import BotoCoreError, ClientError
-
-import os
-from datetime import datetime
 import base64
+import os
+import sys
+from contextlib import closing
+from datetime import datetime
+
 import openai
 import playsound
 import pyttsx3
 import requests
-import speech_recognition as recognition
 import soundfile as sf
-from contextlib import closing
-from tempfile import gettempdir
+import speech_recognition as recognition
+from boto3 import Session
+from botocore.exceptions import BotoCoreError, ClientError
 
 # CONFIG
 
 openAIToken = os.getenv('openAIToken')
 myname = "Michael"
 NameandSpace = "Michael: "  # Change to the individuals name
-session = Session(profile_name="default", region_name='us-west-2') #Need to set up your profile in ~\.aws\
+session = Session(profile_name="default", region_name='us-west-2')  # Need to set up your profile in ~\.aws\
 polly = session.client("polly")
-MAX_CONVERSATION_LENGTH = 200
+MAX_CONVERSATION_LENGTH = 350
 
 engine = pyttsx3.init()
 voices = engine.getProperty('voices')
@@ -119,7 +117,7 @@ try:
                 print("Listening..")
                 audio = speech.listen(source)  # Starts Listening for words
                 try:
-                    text3 = speech.recognize_google(audio)#Only used during pre-checks
+                    text3 = speech.recognize_google(audio)  # Only used during pre-checks
                 except Exception as e:
                     print(e)
                     continue
@@ -138,7 +136,6 @@ try:
                 # print(enc) #DEBUG
                 # print(base64.b64decode(enc)) #DEBUG
 
-
             try:
 
                 if text3 == "":
@@ -156,11 +153,11 @@ try:
                     engine.runAndWait()
                     continue
                 if text == "Stop." or text == "Stop!":
-                    doPolly(name+" is Stopped")
+                    doPolly(name + " is Stopped")
                     pauseFlag = True
                     continue
                 if text == "Make ready." or text == "start" or text == "START." or text == "start":
-                    doPolly(name+" is Resumed")
+                    doPolly(name + " is Resumed")
 
                     pauseFlag = False
                     continue
@@ -172,32 +169,44 @@ try:
                     print("PAUSED")
                     continue
 
+
+                print(len(content))
+
+                if len(content) > MAX_CONVERSATION_LENGTH:
+                    print("MAX LIMIT REACHED")
+                    print("MAX LIMIT REACHED")
+                    print("MAX LIMIT REACHED")
+                    print("MAX LIMIT REACHED")
+                    counter = 0
+                    x = content.split(NameandSpace)
+                    content = ""
+                    for y in x:
+
+                        print(counter)
+                        print(y)
+                        if counter > 1:
+                            # if counter == 1:
+                            content += NameandSpace
+                            content += y
+                        counter += 1
+
+                print(content)
+                content += f"{NameandSpace}{text}\n" + name + ": "
+                response = gpt3(content).lstrip()
+                content += f"{response}\n"
+                doPolly(response)
+
+                # engine.say()
+                # engine.runAndWait()
+
+                #print(content)
+
                 break
             except Exception as e:
                 print(e)
                 print("I did not catch that, let's try again.")
                 pass
-        if len(content) > MAX_CONVERSATION_LENGTH:
 
-            counter = 0
-            x = content.split(NameandSpace)
-            content = ""
-            for y in x:
-                if counter > 0:
-                    # if counter == 1:
-                    content += NameandSpace
-                    content += y
-                counter += 1
 
-        print(content)
-        content += f"{NameandSpace}{text}\n"+name+": "
-        response = gpt3(content).lstrip()
-        content += f"{response}\n"
-        doPolly(response)
-
-        # engine.say()
-        # engine.runAndWait()
-
-        print(content)
 except KeyboardInterrupt:
     pass
