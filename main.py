@@ -1,11 +1,17 @@
+# A python script that listens to the default mic, and sends that audio data to be transcribed to Assembly's AI API,
+# sends that transcription to GPT3, and retrieves the answer and speaks it using AWS Polly TTS
+# By: Mike Null
+# Originally forked from Freya and iterated upon
+
 import base64
 import os
 import sys
 from contextlib import closing
 from datetime import datetime
-
+from pydub import AudioSegment
+from pydub.playback import play
 import openai
-import playsound
+#import playsound
 import pyttsx3
 import requests
 import soundfile as sf
@@ -17,10 +23,13 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 openAIToken = os.getenv('openAIToken')
 myname = "Michael"
-NameandSpace = "Michael: "  # Change to the individuals name
+
+
+
+NameandSpace = myname+": "  # Change to the individuals name
 session = Session(profile_name="default", region_name='us-west-2')  # Need to set up your profile in ~\.aws\
 polly = session.client("polly")
-MAX_CONVERSATION_LENGTH = 350
+MAX_CONVERSATION_LENGTH = 350  ## HIGHER NUMBER WILL COST MORE MONEY TO YOUR OPENAI ACCOUNT
 
 engine = pyttsx3.init()
 voices = engine.getProperty('voices')
@@ -42,9 +51,9 @@ def gpt3(stext):
         engine="text-davinci-003",  # Latest model as of 12/2022
         prompt=stext,
         temperature=0.7,
-        max_tokens=135,
-        top_p=0.99,
-        frequency_penalty=0,
+        max_tokens=150,
+        top_p=0.98,
+        frequency_penalty=0.2,
         presence_penalty=0.6,
         stop=[NameandSpace, f"{name}: "]
     )
@@ -90,7 +99,8 @@ def doPolly(response):
         # The response didn't contain audio data, exit gracefully
         print("Could not stream audio")
         sys.exit(-1)
-    playsound.playsound(output)
+    song = AudioSegment.from_mp3("speech.mp3")
+    play(song)
     os.remove("speech.mp3")
 
 
@@ -102,12 +112,12 @@ def doassembly():
                               json=json,
                               )
     print(response1.json())
-    print(response1.json())
-    print(response1.json())
     return (response1.json()['text'])
 
 
-content += f"Your name is {name}\n{name}: Heyo.\n"
+content += f"Your name is {name}\n{name}: Hello.\n" #CUSTOMIZE THIS LINE FOR A DIFFERENT PERSONAILTY TO TALK TO
+
+
 pauseFlag = False
 try:
     while (True):
@@ -121,7 +131,6 @@ try:
                 except Exception as e:
                     print(e)
                     continue
-
                 with open("microphone-results.flac", "wb") as f:
                     f.write(audio.get_flac_data())
                 # with open("microphone-results.wav", "wb") as q:
@@ -131,10 +140,7 @@ try:
                 data, samplerate = sf.read('new.flac')
                 sf.write('new1.RAW', data, 8000, subtype='PCM_16', format='RAW')
                 enc = base64.b64encode(open("new1.RAW", "rb").read())
-
                 enc1 = enc.decode('UTF-8')
-                # print(enc) #DEBUG
-                # print(base64.b64decode(enc)) #DEBUG
 
             try:
 
@@ -147,10 +153,10 @@ try:
                 # preGenerationCheckouts()
                 print(text)
 
-                if text == "Clear memory.":
+                if text == "Clear memory." or text == "Erase memory." or text == "Erased memory.":
                     content = f"Your name is {name}\n"
                     doPolly("Memory Cleared")
-                    engine.runAndWait()
+                    #engine.runAndWait()
                     continue
                 if text == "Stop." or text == "Stop!":
                     doPolly(name + " is Stopped")
@@ -165,7 +171,7 @@ try:
                     print("CAUGHT A BAD LISTEN")
                     continue
                 if pauseFlag == True:
-                    engine.runAndWait()
+                    #engine.runAndWait()
                     print("PAUSED")
                     continue
 
@@ -173,9 +179,6 @@ try:
                 print(len(content))
 
                 if len(content) > MAX_CONVERSATION_LENGTH:
-                    print("MAX LIMIT REACHED")
-                    print("MAX LIMIT REACHED")
-                    print("MAX LIMIT REACHED")
                     print("MAX LIMIT REACHED")
                     counter = 0
                     x = content.split(NameandSpace)
@@ -190,10 +193,11 @@ try:
                             content += y
                         counter += 1
 
-                print(content)
+
                 content += f"{NameandSpace}{text}\n" + name + ": "
                 response = gpt3(content).lstrip()
                 content += f"{response}\n"
+                print(content)
                 doPolly(response)
 
                 # engine.say()
