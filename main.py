@@ -1,216 +1,169 @@
-# A python script that listens to the default mic, and sends that audio data to be transcribed to Assembly's AI API,
-# sends that transcription to GPT3, and retrieves the answer and speaks it using AWS Polly TTS
-# By: Mike Null
-# Originally forked from Freya and iterated upon
-
-import base64
+import time as pytime
 import os
-import sys
-from contextlib import closing
-from datetime import datetime
+import json
+import sounddevice as sd
+import numpy as np
+import soundfile as sf
+import assemblyai as aai
+from openai import OpenAI
 from pydub import AudioSegment
 from pydub.playback import play
-import openai
-#import playsound
-import pyttsx3
-import requests
-import soundfile as sf
-import speech_recognition as recognition
-from boto3 import Session
-from botocore.exceptions import BotoCoreError, ClientError
+import queue
+from gtts import gTTS
+import simpleaudio as sa
+import speech_recognition as sr  # Google Speech Recognition
 
-# CONFIG
+# Replace with your AssemblyAI API key
+aai.settings.api_key = ""
 
-openAIToken = os.getenv('openAIToken')
-myname = "Michael"
+# Initialization for OpenAI
+client = OpenAI(api_key='')
 
-
-
-NameandSpace = myname+": "  # Change to the individuals name
-session = Session(profile_name="default", region_name='us-west-2')  # Need to set up your profile in ~\.aws\
-polly = session.client("polly")
-MAX_CONVERSATION_LENGTH = 350  ## HIGHER NUMBER WILL COST MORE MONEY TO YOUR OPENAI ACCOUNT
-
-engine = pyttsx3.init()
-voices = engine.getProperty('voices')
-engine.setProperty('voice', voices[1].id)  # Female voice, change to 0 for male voice
-
-volume = engine.getProperty('volume')
-engine.setProperty('volume', 0.6)  # set to 60% volume
-speech = recognition.Recognizer()
-
-name = "Polly"
-date = str(datetime.today()).split(" ")[0]
-
-content = ""
+# Define the queue at the top level
+q = queue.Queue()
 
 
-def gpt3(stext):
-    openai.api_key = openAIToken
-    response = openai.Completion.create(
-        engine="text-davinci-003",  # Latest model as of 12/2022
-        prompt=stext,
-        temperature=0.7,
-        max_tokens=150,
-        top_p=0.98,
-        frequency_penalty=0.2,
-        presence_penalty=0.6,
-        stop=[NameandSpace, f"{name}: "]
-    )
-    return response.choices[0].text
+# Function to capture audio
+def capture_audio():
+    noise_threshold = 0.0001  # Adjust this value based on your noise level
 
+    # Query the default sample rate of the input device
+    default_samplerate = int(sd.query_devices(kind='input')['default_samplerate'])
+    print(f"Using default sample rate: {default_samplerate} Hz")  # Debug statement
 
-def read_file(filename, chunk_size=5242880):
-    with open(filename, 'rb') as _file:
+    # Initialize a list to store audio frames
+    audio_frames = []
+    is_speaking = False
+    silence_start = None
+
+    def callback(indata, frames, callback_time, status):
+        nonlocal is_speaking, silence_start
+        audio_frames.append(indata.copy())  # Store audio data for debugging
+        volume_norm = (indata ** 2).mean() ** 0.5
+
+        # Limit the frequency of debug output
+        if len(audio_frames) % 15 == 0:
+            print(f"Measured volume norm: {volume_norm}")  # Debug statement
+
+        if volume_norm > noise_threshold:
+            is_speaking = True
+            silence_start = None
+        else:
+            if is_speaking:
+                if silence_start is None:
+                    silence_start = pytime.time()
+                elif pytime.time() - silence_start > 1.0:  # Adjust the silence duration as needed
+                    is_speaking = False
+                    audio_data = np.concatenate(audio_frames, axis=0)
+                    q.put(audio_data)
+                    audio_frames.clear()
+                    silence_start = None
+
+    with sd.InputStream(callback=callback, channels=1, samplerate=default_samplerate):
         while True:
-            data = _file.read(chunk_size)
-            if not data:
-                break
-            yield data
-
-
-def doPolly(response):
-    try:
-        # Request speech synthesis
-        response = polly.synthesize_speech(Text=response, OutputFormat="mp3",
-                                           VoiceId="Joanna", Engine="neural")
-    except (BotoCoreError, ClientError) as error:
-        # The service returned an error, exit gracefully
-        print(error)
-        sys.exit(-1)
-    if "AudioStream" in response:
-        # Note: Closing the stream is important because the service throttles on the
-        # number of parallel connections. Here we are using contextlib.closing to
-        # ensure the close method of the stream object will be called automatically
-        # at the end of the with statement's scope.
-        with closing(response["AudioStream"]) as stream:
-            output = os.path.join("speech.mp3")
-
             try:
-                # Open a file for writing the output as a binary stream
-                with open(output, "wb") as file:
-                    file.write(stream.read())
-            except IOError as error:
-                # Could not write to file, exit gracefully
-                print(error)
-                sys.exit(-1)
+                audio_data = q.get(timeout=1)
+                if audio_data is not None:
+                    # Write audio data to a file for debugging
+                    audio_file_path = "recorded_audio.wav"
+                    sf.write(audio_file_path, audio_data, default_samplerate)
+                    print(f"Saved recorded audio to {audio_file_path}")
+                    return audio_file_path
+            except queue.Empty:
+                continue
+ # Adding a small delay to reduce loop frequency
 
+
+# Function to transcribe audio using AssemblyAI
+def transcribe_audio(file_path):
+    transcriber = aai.Transcriber()
+    transcript = transcriber.transcribe(file_path)
+    if transcript.status == aai.TranscriptStatus.error:
+        print(transcript.error)
+        return None
     else:
-        # The response didn't contain audio data, exit gracefully
-        print("Could not stream audio")
-        sys.exit(-1)
-    song = AudioSegment.from_mp3("speech.mp3")
-    play(song)
-    os.remove("speech.mp3")
+        return transcript.text
 
 
-def doassembly():
-    headers = {'authorization': os.getenv('AssemblyToken')}
-    json = {"audio_data": enc1, "punctuate": True}
-    response1 = requests.post('https://api.assemblyai.com/v2/stream',
-                              headers=headers,
-                              json=json,
-                              )
-    print(response1.json())
-    return (response1.json()['text'])
+# Function to transcribe audio using Google Speech Recognition for low latency check
+def quick_transcribe_google(file_path):
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(file_path) as source:
+        audio = recognizer.record(source)
+    try:
+        return recognizer.recognize_google(audio)
+    except sr.UnknownValueError:
+        return ""
 
 
-content += f"Your name is {name}\n{name}: Hello.\n" #CUSTOMIZE THIS LINE FOR A DIFFERENT PERSONAILTY TO TALK TO
+# Function to process text with GPT-4
+def process_with_gpt(text):
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": text}
+        ],
+        temperature=0.7
+    )
+    return response.choices[0].message.content.strip()
 
 
-pauseFlag = False
-try:
-    while (True):
-        while (True):
-            with recognition.Microphone() as source:
-                speech.energy_threshold = 4000
-                print("Listening..")
-                audio = speech.listen(source)  # Starts Listening for words
-                try:
-                    text3 = speech.recognize_google(audio)  # Only used during pre-checks
-                except Exception as e:
-                    print(e)
+# Function to convert text to speech using gtts and play using pydub and simpleaudio
+def text_to_speech(text):
+    tts = gTTS(text=text, lang='en')
+    tts.save('output.mp3')
+    audio = AudioSegment.from_mp3('output.mp3')
+    play(audio)
+
+
+# Main loop
+def main():
+    conversation_history = ""
+    pause_flag = False
+
+    try:
+        while True:
+            if not pause_flag:
+                print("Listening...")
+                audio_file_path = capture_audio()
+                print("Quick transcription check with Google STT...")
+                quick_text = quick_transcribe_google(audio_file_path)
+                print(quick_text)
+                if quick_text == "":
+                    print("No speech detected by Google STT.")
                     continue
-                with open("microphone-results.flac", "wb") as f:
-                    f.write(audio.get_flac_data())
-                # with open("microphone-results.wav", "wb") as q:
-                #     q.write(audio.get_wav_data())
-                os.system(
-                    "ffmpeg -y -i microphone-results.flac -ar 8000 -rematrix_maxval 1.0 -minrate 128k -maxrate 128k -bufsize 128k -ac 1 -b:a 128k new.flac")
-                data, samplerate = sf.read('new.flac')
-                sf.write('new1.RAW', data, 8000, subtype='PCM_16', format='RAW')
-                enc = base64.b64encode(open("new1.RAW", "rb").read())
-                enc1 = enc.decode('UTF-8')
-
-            try:
-
-                if text3 == "":
-                    print("CAUGHT A BAD LISTEN")
+                print("Transcribing audio with AssemblyAI...")
+                text = transcribe_audio(audio_file_path)
+                if text is None:
+                    print("Error in transcription")
                     continue
-                text = doassembly()
-
-                text = text.strip()
-                # preGenerationCheckouts()
-                print(text)
-
-                if text == "Clear memory." or text == "Erase memory." or text == "Erased memory.":
-                    content = f"Your name is {name}\n"
-                    doPolly("Memory Cleared")
-                    #engine.runAndWait()
+                if text == "":
+                    print("Empty transcription from AssemblyAI")
                     continue
-                if text == "Stop." or text == "Stop!":
-                    doPolly(name + " is Stopped")
-                    pauseFlag = True
+                print(f"Heard: {text}")  # Debug statement
+                if text.lower() in ["clear memory", "erase memory"]:
+                    conversation_history = ""
+                    text_to_speech("Memory cleared")
                     continue
-                if text == "Make ready." or text == "start" or text == "START." or text == "start":
-                    doPolly(name + " is Resumed")
-
-                    pauseFlag = False
+                if text.lower() in ["stop"]:
+                    text_to_speech("Stopping")
+                    pause_flag = True
                     continue
-                if text == "" or len(text) < 4:
-                    print("CAUGHT A BAD LISTEN")
-                    continue
-                if pauseFlag == True:
-                    #engine.runAndWait()
-                    print("PAUSED")
+                if text.lower() in ["start"]:
+                    text_to_speech("Resuming")
+                    pause_flag = False
                     continue
 
-
-                print(len(content))
-
-                if len(content) > MAX_CONVERSATION_LENGTH:
-                    print("MAX LIMIT REACHED")
-                    counter = 0
-                    x = content.split(NameandSpace)
-                    content = ""
-                    for y in x:
-
-                        print(counter)
-                        print(y)
-                        if counter > 1:
-                            # if counter == 1:
-                            content += NameandSpace
-                            content += y
-                        counter += 1
+                conversation_history += f"User: {text}\n"
+                response = process_with_gpt(conversation_history)
+                conversation_history += f"Assistant: {response}\n"
+                text_to_speech(response)
+            else:
+                print("Paused")
+    except KeyboardInterrupt:
+        pass
 
 
-                content += f"{NameandSpace}{text}\n" + name + ": "
-                response = gpt3(content).lstrip()
-                content += f"{response}\n"
-                print(content)
-                doPolly(response)
-
-                # engine.say()
-                # engine.runAndWait()
-
-                #print(content)
-
-                break
-            except Exception as e:
-                print(e)
-                print("I did not catch that, let's try again.")
-                pass
-
-
-except KeyboardInterrupt:
-    pass
+if __name__ == "__main__":
+    main()
