@@ -24,16 +24,23 @@ amplification_factor = 1.0  # Adjust this value to amplify the input
 
 
 # Function to measure ambient noise with band-pass filtering
-def measure_ambient_noise(duration=10, samplerate=44100, kernel_size=3):
+def measure_ambient_noise(duration=30, kernel_size=3):
     print("Measuring ambient noise...")
-    recording = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1)
+
+    # Query the default sample rate of the input device
+    default_samplerate = int(sd.query_devices(kind='input')['default_samplerate'])
+    print(f"Using default sample rate: {default_samplerate} Hz")
+
+    # Record ambient noise for the specified duration using the default sample rate
+    recording = sd.rec(int(duration * default_samplerate), samplerate=default_samplerate, channels=1)
     sd.wait()  # Wait until recording is finished
 
-    # Apply band-pass filtering
+    # Apply band-pass filtering to the recorded audio
     low_cutoff = 300.0  # Lower cutoff frequency in Hz
     high_cutoff = 3400.0  # Higher cutoff frequency in Hz
-    filtered_recording = bandpass_filter(recording.flatten(), samplerate, low_cutoff, high_cutoff)
+    filtered_recording = bandpass_filter(recording.flatten(), default_samplerate, low_cutoff, high_cutoff)
 
+    # Calculate the RMS values of the filtered recording
     rms_values = np.sqrt(np.mean(filtered_recording ** 2, axis=0))
 
     # Ensure kernel_size does not exceed the extent of rms_values
@@ -41,13 +48,14 @@ def measure_ambient_noise(duration=10, samplerate=44100, kernel_size=3):
         rms_values = np.array([rms_values])
     kernel_size = min(kernel_size, len(rms_values) // 2 * 2 + 1)  # kernel_size must be odd and <= len(rms_values)
 
-    # Apply median filter to smooth the rms values
+    # Apply median filter to smooth the RMS values
     filtered_rms_values = medfilt(rms_values, kernel_size=kernel_size)
 
+    # Determine the maximum volume level of the ambient noise
     volume_max = np.max(filtered_rms_values)
 
     print(f"Measured maximum ambient noise level: {volume_max}")
-    text_to_speech("Listening!")
+    text_to_speech("Listening!")  # Inform the user that the system is listening
     return volume_max
 
 
@@ -68,43 +76,54 @@ def capture_audio():
     default_samplerate = int(sd.query_devices(kind='input')['default_samplerate'])
     print(f"Using default sample rate: {default_samplerate} Hz")
 
-    # Initialize a list to store audio frames
+    # Initialize variables
     audio_frames = []
     is_speaking = False
     silence_start = None
+    buffer = []  # Buffer to handle brief periods of silence
+    buffer_duration = 2  # Buffer duration in seconds
 
     def callback(indata, frames, callback_time, status):
-        nonlocal is_speaking, silence_start
+        nonlocal is_speaking, silence_start, buffer
         # Amplify the input signal
         amplified_data = indata * amplification_factor
-        audio_frames.append(amplified_data)
         volume_norm = (amplified_data ** 2).mean() ** 0.5
+
+        # Maintain a buffer of the last 2 seconds of audio
+        buffer.append(amplified_data)
+        if len(buffer) * frames / default_samplerate > buffer_duration:
+            buffer.pop(0)
 
         if len(audio_frames) % 15 == 0:
             print(f"Measured volume norm: {volume_norm}")
 
         if volume_norm > noise_threshold:
             is_speaking = True
+            # Append the buffer to audio_frames when speech is detected
+            audio_frames.extend(buffer)
+            buffer.clear()
+            audio_frames.append(amplified_data)
             silence_start = None
         else:
             if is_speaking:
                 if silence_start is None:
                     silence_start = pytime.time()
-                elif pytime.time() - silence_start > 3.0:  # Changed from 1.0 to 3.0 seconds
+                elif pytime.time() - silence_start > 3.0:  # Adjust silence duration as needed
                     is_speaking = False
                     audio_data = np.concatenate(audio_frames, axis=0)
-                    q.put(audio_data)
+                    q.put(audio_data)  # Add the audio data to the queue
                     audio_frames.clear()
                     silence_start = None
 
+    # Open an input stream to capture audio
     with sd.InputStream(callback=callback, channels=1, samplerate=default_samplerate):
         while not pause_flag:
             try:
                 audio_data = q.get(timeout=1)
                 if audio_data is not None:
-                    # Apply noise reduction with adjusted parameters
+                    # Apply noise reduction to the captured audio
                     reduced_noise_audio = nr.reduce_noise(y=audio_data.flatten(), sr=default_samplerate,
-                                                          stationary=True, prop_decrease=0.8)
+                                                          stationary=True, prop_decrease=0.3)
                     audio_file_path = "recorded_audio.wav"
                     sf.write(audio_file_path, reduced_noise_audio, default_samplerate)
                     print(f"Saved recorded audio to {audio_file_path}")
