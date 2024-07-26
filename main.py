@@ -11,43 +11,56 @@ from pydub import AudioSegment
 import noisereduce as nr
 from pynput import keyboard
 from openai import OpenAI
+import speech_recognition as sr
+from threading import Thread
 
-# Initialize OpenAI client
+# Initialize OpenAI client with API key
 client = OpenAI(api_key="")
 
-# Define the queue at the top level
+# Define the queue at the top level for audio data
 q = queue.Queue()
 
 # Global variables
-pause_flag = False
-vad_mode = 2  # VAD aggressiveness mode (0-3)
+pause_flag = False  # Flag to pause and resume listening
+stop_playback = False  # Flag to stop audio playback
+vad_mode = 3  # VAD (Voice Activity Detection) aggressiveness mode (0-3)
 vad = webrtcvad.Vad(vad_mode)
 
-# Set the sample rate and frame duration
+# Set the sample rate and frame duration for audio capture
 sample_rate = 16000  # 16kHz sample rate
 frame_duration_ms = 20  # Frame duration in milliseconds (10ms, 20ms, or 30ms)
 frame_length = int(sample_rate * frame_duration_ms / 1000)  # Frame length in samples
 
+
 # Function to play audio files using simpleaudio
 def play_audio(file_path):
+    global stop_playback
+
     wave_obj = sa.WaveObject.from_wave_file(file_path)
     play_obj = wave_obj.play()
-    play_obj.wait_done()
 
-# Function to capture audio
+    while play_obj.is_playing():
+        if stop_playback:
+            play_obj.stop()
+            break
+        pytime.sleep(0.1)
+    stop_playback = False
+
+
+# Function to capture audio from the microphone
 def capture_audio():
     global pause_flag
 
-    # Initialize variables
+    # Initialize variables for audio capture
     audio_frames = []
     is_speaking = False
     silence_start = None
     buffer = []  # Buffer to handle brief periods of silence
     buffer_duration = 2  # Buffer duration in seconds
-    debug_counter = 0  # Counter for limiting debug messages
 
+    # Callback function to process audio frames
     def callback(indata, frames, callback_time, status):
-        nonlocal is_speaking, silence_start, buffer, debug_counter
+        nonlocal is_speaking, silence_start, buffer
 
         if frames != frame_length:
             print(f"Unexpected frame length: {frames}")
@@ -86,7 +99,6 @@ def capture_audio():
         if len(buffer) * frames / sample_rate > buffer_duration:
             buffer.pop(0)
 
-
     # Open an input stream to capture audio
     with sd.InputStream(callback=callback, channels=1, samplerate=sample_rate, blocksize=frame_length, dtype='float32'):
         while not pause_flag:
@@ -94,8 +106,8 @@ def capture_audio():
                 audio_data = q.get(timeout=1)
                 if audio_data is not None:
                     # Apply noise reduction to the captured audio
-                    reduced_noise_audio = nr.reduce_noise(y=audio_data.flatten(), sr=sample_rate,
-                                                          stationary=True, prop_decrease=0.3)
+                    reduced_noise_audio = nr.reduce_noise(y=audio_data.flatten(), sr=sample_rate, stationary=True,
+                                                          prop_decrease=0.3)
                     audio_file_path = "recorded_audio.wav"
                     sf.write(audio_file_path, reduced_noise_audio, sample_rate)
                     print(f"Saved recorded audio to {audio_file_path}")
@@ -104,18 +116,38 @@ def capture_audio():
                 continue
 
 # Function to transcribe audio using OpenAI's Whisper API
-def transcribe_audio(file_path):
+def transcribe_audio_openai(file_path):
     with open(file_path, "rb") as audio_file:
         response = client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file
         )
     return response.text
+# Function to transcribe audio using Google's Speech Recognition API
+def transcribe_audio(file_path):
+    r = sr.Recognizer()
+    with sr.AudioFile(file_path) as source:
+        audio = r.record(source)
+        try:
+            text = r.recognize_google(audio)
+            if text.strip() == "":
+                print("No speech detected.")
+                return None
+            else:
+                print("Google Speech Recognition thinks you said: " + text)
+                return text
+        except sr.UnknownValueError:
+            print("Google Speech Recognition could not understand audio")
+            return None
+        except sr.RequestError as e:
+            print(f"Could not request results from Google Speech Recognition service; {e}")
+            return None
+
 
 # Function to process text with GPT-4
 def process_with_gpt(text):
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4",
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": text}
@@ -124,8 +156,11 @@ def process_with_gpt(text):
     )
     return response.choices[0].message.content.strip()
 
+
 # Function to convert text to speech using OpenAI's TTS API and play it
 def text_to_speech(text):
+    global stop_playback
+
     response = client.audio.speech.create(
         model="tts-1",
         voice="alloy",
@@ -144,12 +179,32 @@ def text_to_speech(text):
     wav_file_path = "output.wav"
     audio.export(wav_file_path, format="wav")
 
-    # Play the WAV file using simpleaudio
-    wave_obj = sa.WaveObject.from_wave_file(wav_file_path)
-    play_obj = wave_obj.play()
-    play_obj.wait_done()
+    # Play the WAV file using simpleaudio in a separate thread
+    play_thread = Thread(target=play_audio, args=(wav_file_path,))
+    play_thread.start()
 
-# Main loop
+    # Check for "Stop" command while playing audio
+    r = sr.Recognizer()
+    with sr.Microphone(sample_rate=sample_rate) as source:
+        while play_thread.is_alive():
+            try:
+                audio = r.listen(source, timeout=1, phrase_time_limit=2)
+                text = r.recognize_google(audio)
+                if "stop" in text.lower():
+                    stop_playback = True
+                    break
+            except sr.WaitTimeoutError:
+                continue
+            except sr.UnknownValueError:
+                continue
+            except sr.RequestError as e:
+                print(f"Could not request results from Google Speech Recognition service; {e}")
+                break
+
+    play_thread.join()
+
+
+# Main loop to capture, transcribe, process, and respond to audio input
 def main():
     global pause_flag
     conversation_history = ""
@@ -160,28 +215,34 @@ def main():
                 print("Listening...")
                 audio_file_path = capture_audio()
                 if audio_file_path:
-                    print("Transcribing audio with OpenAI Whisper API...")
+                    print("Transcribing audio with Google Speech Recognition...")
                     text = transcribe_audio(audio_file_path)
+
                     if text is None or text.strip() == "":
                         print("Error in transcription or empty transcription")
                         continue
-
-                    print(f"Heard: {text}")
-
-                    if text.lower() in ["clear memory.", "erase memory.", "clear memory", "erase memory"]:
-                        conversation_history = ""
-                        text_to_speech("Memory cleared!!")
+                    openai_text = transcribe_audio_openai(audio_file_path)
+                    if openai_text is None or openai_text.strip() == "":
+                        print("Error in transcription or empty transcription")
                         continue
-                    if text.lower() in ["stop.", "stop"]:
-                        text_to_speech("Stopped!!")
+                    print(f"Heard: {openai_text}")
+
+                    # Commands to clear memory, stop, and start listening
+                    if openai_text.lower() in ["clear memory.", "erase memory.", "clear memory", "erase memory"]:
+                        conversation_history = ""
+                        text_to_speech("Memory cleared!")
+                        continue
+                    if openai_text.lower() in ["stop.", "stop"]:
+                        text_to_speech("Stopped!")
                         pause_flag = True
                         continue
-                    if text.lower() in ["start.", "start"]:
-                        text_to_speech("Resuming!!")
+                    if openai_text.lower() in ["start.", "start"]:
+                        text_to_speech("Resuming!")
                         pause_flag = False
                         continue
 
-                    conversation_history += f"User: {text}\n"
+                    # Process user input with GPT-4 and generate a response
+                    conversation_history += f"User: {openai_text}\n"
                     response = process_with_gpt(conversation_history)
                     conversation_history += f"Assistant: {response}\n"
                     text_to_speech(response)
@@ -190,6 +251,8 @@ def main():
     except KeyboardInterrupt:
         pass
 
+
+# Function to handle media play/pause key press to pause and resume listening
 def on_press(key):
     global pause_flag
     try:
@@ -204,7 +267,9 @@ def on_press(key):
     except AttributeError:
         pass
 
+
 if __name__ == "__main__":
+    # Start the keyboard listener for media play/pause key
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     main()
