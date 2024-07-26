@@ -4,14 +4,15 @@ import json
 import sounddevice as sd
 import numpy as np
 import soundfile as sf
-from openai import OpenAI
+import webrtcvad
 import queue
 import simpleaudio as sa
 from pydub import AudioSegment
 import noisereduce as nr
 from pynput import keyboard
-from scipy.signal import medfilt
+from openai import OpenAI
 
+# Initialize OpenAI client
 client = OpenAI(api_key="")
 
 # Define the queue at the top level
@@ -19,62 +20,23 @@ q = queue.Queue()
 
 # Global variables
 pause_flag = False
-noise_threshold = 0.0
-amplification_factor = 1.0  # Adjust this value to amplify the input
+vad_mode = 2  # VAD aggressiveness mode (0-3)
+vad = webrtcvad.Vad(vad_mode)
 
+# Set the sample rate and frame duration
+sample_rate = 16000  # 16kHz sample rate
+frame_duration_ms = 20  # Frame duration in milliseconds (10ms, 20ms, or 30ms)
+frame_length = int(sample_rate * frame_duration_ms / 1000)  # Frame length in samples
 
-# Function to measure ambient noise with band-pass filtering
-def measure_ambient_noise(duration=30, kernel_size=3):
-    print("Measuring ambient noise...")
-
-    # Query the default sample rate of the input device
-    default_samplerate = int(sd.query_devices(kind='input')['default_samplerate'])
-    print(f"Using default sample rate: {default_samplerate} Hz")
-
-    # Record ambient noise for the specified duration using the default sample rate
-    recording = sd.rec(int(duration * default_samplerate), samplerate=default_samplerate, channels=1)
-    sd.wait()  # Wait until recording is finished
-
-    # Apply band-pass filtering to the recorded audio
-    low_cutoff = 300.0  # Lower cutoff frequency in Hz
-    high_cutoff = 3400.0  # Higher cutoff frequency in Hz
-    filtered_recording = bandpass_filter(recording.flatten(), default_samplerate, low_cutoff, high_cutoff)
-
-    # Calculate the RMS values of the filtered recording
-    rms_values = np.sqrt(np.mean(filtered_recording ** 2, axis=0))
-
-    # Ensure kernel_size does not exceed the extent of rms_values
-    if np.isscalar(rms_values):
-        rms_values = np.array([rms_values])
-    kernel_size = min(kernel_size, len(rms_values) // 2 * 2 + 1)  # kernel_size must be odd and <= len(rms_values)
-
-    # Apply median filter to smooth the RMS values
-    filtered_rms_values = medfilt(rms_values, kernel_size=kernel_size)
-
-    # Determine the maximum volume level of the ambient noise
-    volume_max = np.max(filtered_rms_values)
-
-    print(f"Measured maximum ambient noise level: {volume_max}")
-    text_to_speech("Listening!")  # Inform the user that the system is listening
-    return volume_max
-
-
-def bandpass_filter(data, samplerate, low_cutoff, high_cutoff):
-    from scipy.signal import butter, lfilter
-    nyquist = 0.5 * samplerate
-    low = low_cutoff / nyquist
-    high = high_cutoff / nyquist
-    b, a = butter(1, [low, high], btype='band')
-    return lfilter(b, a, data)
-
+# Function to play audio files using simpleaudio
+def play_audio(file_path):
+    wave_obj = sa.WaveObject.from_wave_file(file_path)
+    play_obj = wave_obj.play()
+    play_obj.wait_done()
 
 # Function to capture audio
 def capture_audio():
-    global pause_flag, noise_threshold
-
-    # Query the default sample rate of the input device
-    default_samplerate = int(sd.query_devices(kind='input')['default_samplerate'])
-    print(f"Using default sample rate: {default_samplerate} Hz")
+    global pause_flag
 
     # Initialize variables
     audio_frames = []
@@ -82,55 +44,64 @@ def capture_audio():
     silence_start = None
     buffer = []  # Buffer to handle brief periods of silence
     buffer_duration = 2  # Buffer duration in seconds
+    debug_counter = 0  # Counter for limiting debug messages
 
     def callback(indata, frames, callback_time, status):
-        nonlocal is_speaking, silence_start, buffer
-        # Amplify the input signal
-        amplified_data = indata * amplification_factor
-        volume_norm = (amplified_data ** 2).mean() ** 0.5
+        nonlocal is_speaking, silence_start, buffer, debug_counter
+
+        if frames != frame_length:
+            print(f"Unexpected frame length: {frames}")
+            return  # Skip frames that do not match the expected length
+
+        # Convert audio frame to byte array for VAD
+        byte_data = (indata.flatten() * 32767).astype(np.int16).tobytes()
+
+        try:
+            if vad.is_speech(byte_data, sample_rate=sample_rate):
+                if not is_speaking:
+                    print("Speech detected")
+                is_speaking = True
+                # Append the buffer to audio_frames when speech is detected
+                audio_frames.extend(buffer)
+                buffer.clear()
+                audio_frames.append(indata.copy())
+                silence_start = None
+            else:
+                if is_speaking:
+                    if silence_start is None:
+                        silence_start = pytime.time()
+                        print("Silence started")
+                    elif pytime.time() - silence_start > 3.0:  # Adjust silence duration as needed
+                        is_speaking = False
+                        print("End of speech detected")
+                        audio_data = np.concatenate(audio_frames, axis=0)
+                        q.put(audio_data)  # Add the audio data to the queue
+                        audio_frames.clear()
+                        silence_start = None
+        except Exception as e:
+            print(f"Error during VAD processing: {e}")
 
         # Maintain a buffer of the last 2 seconds of audio
-        buffer.append(amplified_data)
-        if len(buffer) * frames / default_samplerate > buffer_duration:
+        buffer.append(indata.copy())
+        if len(buffer) * frames / sample_rate > buffer_duration:
             buffer.pop(0)
 
-        if len(audio_frames) % 15 == 0:
-            print(f"Measured volume norm: {volume_norm}")
-
-        if volume_norm > noise_threshold:
-            is_speaking = True
-            # Append the buffer to audio_frames when speech is detected
-            audio_frames.extend(buffer)
-            buffer.clear()
-            audio_frames.append(amplified_data)
-            silence_start = None
-        else:
-            if is_speaking:
-                if silence_start is None:
-                    silence_start = pytime.time()
-                elif pytime.time() - silence_start > 3.0:  # Adjust silence duration as needed
-                    is_speaking = False
-                    audio_data = np.concatenate(audio_frames, axis=0)
-                    q.put(audio_data)  # Add the audio data to the queue
-                    audio_frames.clear()
-                    silence_start = None
 
     # Open an input stream to capture audio
-    with sd.InputStream(callback=callback, channels=1, samplerate=default_samplerate):
+    with sd.InputStream(callback=callback, channels=1, samplerate=sample_rate, blocksize=frame_length, dtype='float32'):
         while not pause_flag:
             try:
                 audio_data = q.get(timeout=1)
                 if audio_data is not None:
                     # Apply noise reduction to the captured audio
-                    reduced_noise_audio = nr.reduce_noise(y=audio_data.flatten(), sr=default_samplerate,
+                    reduced_noise_audio = nr.reduce_noise(y=audio_data.flatten(), sr=sample_rate,
                                                           stationary=True, prop_decrease=0.3)
                     audio_file_path = "recorded_audio.wav"
-                    sf.write(audio_file_path, reduced_noise_audio, default_samplerate)
+                    sf.write(audio_file_path, reduced_noise_audio, sample_rate)
                     print(f"Saved recorded audio to {audio_file_path}")
                     return audio_file_path
             except queue.Empty:
                 continue
-
 
 # Function to transcribe audio using OpenAI's Whisper API
 def transcribe_audio(file_path):
@@ -140,7 +111,6 @@ def transcribe_audio(file_path):
             file=audio_file
         )
     return response.text
-
 
 # Function to process text with GPT-4
 def process_with_gpt(text):
@@ -153,7 +123,6 @@ def process_with_gpt(text):
         temperature=0.7
     )
     return response.choices[0].message.content.strip()
-
 
 # Function to convert text to speech using OpenAI's TTS API and play it
 def text_to_speech(text):
@@ -180,17 +149,12 @@ def text_to_speech(text):
     play_obj = wave_obj.play()
     play_obj.wait_done()
 
-
 # Main loop
 def main():
-    global pause_flag, noise_threshold
+    global pause_flag
     conversation_history = ""
 
     try:
-        # Measure ambient noise level to set the noise threshold
-        ambient_noise_level = measure_ambient_noise()
-        noise_threshold = ambient_noise_level * 1.5  # Adjust the multiplier based on your environment
-
         while True:
             if not pause_flag:
                 print("Listening...")
@@ -216,11 +180,6 @@ def main():
                         text_to_speech("Resuming!!")
                         pause_flag = False
                         continue
-                    if text.lower() in ["remeasure noise.", "remeasure background noise."]:
-                        text_to_speech("Measuring background noise.")
-                        ambient_noise_level = measure_ambient_noise()
-                        noise_threshold = ambient_noise_level * 1.5
-                        text_to_speech("Background noise measurement complete.")
 
                     conversation_history += f"User: {text}\n"
                     response = process_with_gpt(conversation_history)
@@ -230,7 +189,6 @@ def main():
                 pytime.sleep(1)
     except KeyboardInterrupt:
         pass
-
 
 def on_press(key):
     global pause_flag
@@ -245,7 +203,6 @@ def on_press(key):
                 text_to_speech("Listening resumed!")
     except AttributeError:
         pass
-
 
 if __name__ == "__main__":
     listener = keyboard.Listener(on_press=on_press)
