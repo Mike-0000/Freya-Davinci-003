@@ -1,6 +1,4 @@
 import time as pytime
-import os
-import json
 import sounddevice as sd
 import numpy as np
 import soundfile as sf
@@ -31,7 +29,6 @@ sample_rate = 16000  # 16kHz sample rate
 frame_duration_ms = 20  # Frame duration in milliseconds (10ms, 20ms, or 30ms)
 frame_length = int(sample_rate * frame_duration_ms / 1000)  # Frame length in samples
 
-
 # Function to play audio files using simpleaudio
 def play_audio(file_path):
     global stop_playback
@@ -45,7 +42,6 @@ def play_audio(file_path):
             break
         pytime.sleep(0.1)
     stop_playback = False
-
 
 # Function to capture audio from the microphone
 def capture_audio():
@@ -115,6 +111,18 @@ def capture_audio():
             except queue.Empty:
                 continue
 
+# Function to trim audio to the first 5 seconds
+def trim_audio_to_5_seconds(file_path):
+    try:
+        audio = AudioSegment.from_wav(file_path)
+        trimmed_audio = audio[:5000]  # Trim to first 5 seconds (5000 ms)
+        trimmed_file_path = "trimmed_audio.wav"
+        trimmed_audio.export(trimmed_file_path, format="wav")
+        return trimmed_file_path
+    except Exception as e:
+        print(f"Error trimming audio: {e}")
+        return None
+
 # Function to transcribe audio using OpenAI's Whisper API
 def transcribe_audio_openai(file_path):
     with open(file_path, "rb") as audio_file:
@@ -123,6 +131,7 @@ def transcribe_audio_openai(file_path):
             file=audio_file
         )
     return response.text
+
 # Function to transcribe audio using Google's Speech Recognition API
 def transcribe_audio(file_path):
     r = sr.Recognizer()
@@ -143,7 +152,6 @@ def transcribe_audio(file_path):
             print(f"Could not request results from Google Speech Recognition service; {e}")
             return None
 
-
 # Function to process text with GPT-4
 def process_with_gpt(text):
     response = client.chat.completions.create(
@@ -155,7 +163,6 @@ def process_with_gpt(text):
         temperature=0.7
     )
     return response.choices[0].message.content.strip()
-
 
 # Function to convert text to speech using OpenAI's TTS API and play it
 def text_to_speech(text):
@@ -203,7 +210,6 @@ def text_to_speech(text):
 
     play_thread.join()
 
-
 # Main loop to capture, transcribe, process, and respond to audio input
 def main():
     global pause_flag
@@ -216,11 +222,19 @@ def main():
                 audio_file_path = capture_audio()
                 if audio_file_path:
                     print("Transcribing audio with Google Speech Recognition...")
-                    text = transcribe_audio(audio_file_path)
+                    trimmed_audio_file_path = trim_audio_to_5_seconds(audio_file_path)
+
+                    # Handle error if audio is less than 5 seconds
+                    if not trimmed_audio_file_path:
+                        print("Error trimming audio or audio less than 5 seconds")
+                        continue
+
+                    text = transcribe_audio(trimmed_audio_file_path)
 
                     if text is None or text.strip() == "":
                         print("Error in transcription or empty transcription")
                         continue
+
                     openai_text = transcribe_audio_openai(audio_file_path)
                     if openai_text is None or openai_text.strip() == "":
                         print("Error in transcription or empty transcription")
@@ -245,12 +259,12 @@ def main():
                     conversation_history += f"User: {openai_text}\n"
                     response = process_with_gpt(conversation_history)
                     conversation_history += f"Assistant: {response}\n"
+                    print(f"Assistant: {response}")
                     text_to_speech(response)
             else:
                 pytime.sleep(1)
     except KeyboardInterrupt:
         pass
-
 
 # Function to handle media play/pause key press to pause and resume listening
 def on_press(key):
@@ -266,7 +280,6 @@ def on_press(key):
                 text_to_speech("Listening resumed!")
     except AttributeError:
         pass
-
 
 if __name__ == "__main__":
     # Start the keyboard listener for media play/pause key
